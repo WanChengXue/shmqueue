@@ -16,6 +16,49 @@ DataServer 进程:  recv(ZMQ) → 解压 → replay buffer → 采样 → fast-e
 LearnerServer 进程: prefetch worker 线程 pop_raw → fast-decode(零拷贝) → pin_memory → deque → H2D → GPU 训练
 ```
 
+### 1.1 worker – queue – learner 对应关系
+
+多 worker（sampler，CPU）经 ZMQ 把 trajectory 推给 data_server；data_server 采样后 fast-encode 入 shmqueue；learner（GPU）的 prefetch worker 从 queue pop、pin、送 GPU。对应关系：
+
+- **worker → data_server**：ZMQ PULL，**不绑定**——任一 worker 的数据可被任一 data_server 接收（负载均衡）
+- **data_server → queue**：**1 : 1**——每 GPU 有 `data_server_number_per_device`(=8) 个 data_server，每个独占一个 shmqueue（`{exp}_queue_{flat_idx}`）
+- **queue → learner**：**N : 1**——每 GPU 1 个 learner，消费该 GPU 的全部 8 个 queue（8 个 prefetch worker 线程，一 queue 一消费者，无 fcntl 锁争用）
+- **多 GPU / 多机**：每 GPU 重复该结构；learner 间走 DDP（NCCL）同步梯度，与 shmqueue 无关
+
+```mermaid
+graph LR
+    subgraph W["N workers (sampler, CPU)"]
+      W0["worker-0"]
+      W1["worker-1"]
+      WN["worker-N"]
+    end
+    subgraph D["data_server × 8 (per GPU)"]
+      DS0["ds_0"]
+      DS1["ds_1"]
+      DS7["ds_7"]
+    end
+    subgraph Q["shmqueue × 8 (POSIX shm)"]
+      Q0["queue_0"]
+      Q1["queue_1"]
+      Q7["queue_7"]
+    end
+    L["learner (GPU)<br/>8 prefetch workers"]
+
+    W0 -.->|"ZMQ PUSH<br/>trajectory"| DS0
+    W1 -.->|"ZMQ"| DS1
+    WN -.->|"ZMQ"| DS7
+
+    DS0 -->|"fast-encode<br/>push_raw"| Q0
+    DS1 --> Q1
+    DS7 --> Q7
+
+    Q0 -->|"pop_raw<br/>decode<br/>pin_memory"| L
+    Q1 --> L
+    Q7 --> L
+```
+
+> 图中虚线（worker → data_server 的 ZMQ）在 shmqueue 范围**之外**；实线（data_server → queue → learner）是 shmqueue 覆盖的 producer/consumer 数据通路。
+
 这条通路的核心机制 —— **POSIX 共享内存环形队列 + 零拷贝 flat-binary 编解码 + producer/consumer 流水线** —— 本质是通用的进程间高吞吐数据交换，与 RL 业务（environment / algorithm / model / replay buffer）无关。但它原本深耦合在 RL 框架里：
 
 - `DataServer` 依赖 `get_environment` / `create_buffer` / `get_data_class`
