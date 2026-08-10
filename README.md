@@ -178,7 +178,7 @@ shmqueue/
 │   ├── bench_throughput.py   # 1P1C / NP-MC 端到端 msg/s, MiB/s
 │   ├── bench_codec.py        # encode/decode μs/batch vs pickle
 │   ├── bench_latency.py      # push→pop 单条 p50/p99
-│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §8.0)
+│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §9.0)
 └── tests/
     ├── test_queue.py         # 基础 push/pop、满队列、多进程 attach、codec 往返
     ├── test_zmq_source.py    # ZMQ 网络发送 → shmqueue 链路
@@ -262,9 +262,70 @@ shmqueue/
 
 ---
 
-## 8. 验证计划
+## 8. 资源均衡与动态保护
 
-### 8.0 测试数据源（统一接口）
+shmqueue 运行在单机多进程环境，与 GPU 训练、系统进程**共享**同一台机器的 CPU 与内存。任何单一环节都不允许把 CPU 或内存吃满——producer 抢光 CPU 会拖慢 consumer、队列占满内存会 OOM 整机。本节定义资源均衡策略：**支持运行时动态调节，但以多重保护兜底，确保任何情况下都不会直接打满机器**。
+
+下列机制均来自 rl_framework 已有实现（搬运后去 RL 化、参数化），来源标注于各条。
+
+### 8.1 内存保护
+
+| 机制 | 行为 | 来源 |
+|------|------|------|
+| **auto maxsize** | 队列容量按物理内存预算自动计算，**留 20% 余量**：`shm_budget = RAM × 0.8`，`maxsize = clip(shm_budget / 队列数 / slot_size, 10, 10000)`。不靠人估，按实际 RAM 反推 | `shared_memory_queue.compute_auto_maxsize` |
+| **total_shm 显式预算** | 创建队列前打印总量 `total_shm = dev_num × ds_per_gpu × maxsize × slot_size`（GiB），超 RAM 即拒绝创建。让内存占用一目了然、可审计 | `supervisor._create_shm_queues` |
+| **slot 容量硬限** | 单 batch 序列化后超 `slot_size` 直接抛 `ValueError` 拒绝入队——不让一条异常大 batch 把整个 slot 撑爆、连锁拖垮 ring | `SharedMemoryQueue.push_raw` |
+| **soft_limit 背压** | 队列深度超过 `maxsize × soft_limit_ratio` 即拒写（`push_raw` 返回 `False`），producer 自行降速。**满队列时丢批而非堆积内存**，是防 OOM 的第一道闸 | `push_raw` soft_limit 分支 |
+
+四道闸层层兜底：容量按 80% RAM 自动算（不会一开始就占满）→ 总量打印可审计 → 单条硬限防异常数据 → 软限背压防 producer 失速堆积。
+
+### 8.2 CPU 保护
+
+| 机制 | 行为 | 来源 |
+|------|------|------|
+| **线程数显式上限** | 每进程 `OMP/MKL/OPENBLAS_NUM_THREADS` 受控：consumer（learner）≤8、producer（data_server）builder 线程数受配置约束、辅助服务（log/model server）=2。**不任由 numpy/torch 把所有核占满** | learner/data_server env |
+| **单轮 recv 上限** | producer 每轮最多 recv `_MAX_RECV_PER_CYCLE=256` 条即让出，防止一直 recv 把 CPU 占满、饿死 encode/push 等其他逻辑 | `data_server._MAX_RECV_PER_CYCLE` |
+| **一 queue 一消费者** | prefetch worker 数 = 队列数，不超额起线程；consumer 侧并发度与队列数对齐，避免无谓线程争用 | learner prefetch workers |
+
+CPU 保护思路：**所有并发源都有显式上限**（线程数、单轮处理量、worker 数），不存在"按需无限扩张"的路径。
+
+### 8.3 动态调节（运行时可调，但受保护阈值约束）
+
+支持运行时调整，而非写死：
+
+- **soft_limit 运行时可调**：背压阈值 `soft_limit_ratio` 可在不重建队列的前提下调整。consumer 跟不上、queue_rejects 升高时调高 soft_limit 增加缓冲；内存吃紧时调低 soft_limit 提前丢批保内存。
+- **prefetch_qsize 可调**：consumer 饥饿（deque 常空）则调大 `learner_prefetch_queue_size`（默认 50）；内存紧则调小。
+- **自适应 producer 速率**：`queue_rejects` 持续升高 → 传导 producer 降采样率/降并发（背压传导，而非无脑往队列塞）。
+
+**关键约束**：动态调节的上下限由 §8.1/§8.2 的硬保护界定——soft_limit 再调高也不能突破 `maxsize`（auto maxsize 已按 80% RAM 封顶），线程数再调也受显式上限约束。**动态只在该区间内滑动，绝不能突破硬保护把机器打满。**
+
+### 8.4 错误熔断与恢复（防异常循环烧 CPU）
+
+异常情况下不能无限空转/无限重启把 CPU 烧满：
+
+| 机制 | 行为 | 来源 |
+|------|------|------|
+| **连续错误熔断** | producer `_ERROR_BURST_LIMIT=10`、consumer `_MAX_CONSECUTIVE_ERRORS=10`：连续异常达限即退出，不无限空转烧 CPU | data_server / learner_server |
+| **restart 指数退避** | 重启间隔 `1 → 2 → 4 → … → 60s` 封顶（`_BASE=1, _MAX=60`），稳定运行 `_RESET_SEC=300s` 后归零。崩溃循环不会高频重启打满 CPU | `supervisor.Backoff` |
+| **重启次数硬上限** | `_MAX_CONSECUTIVE_RESTARTS=20` 后标记 unhealthy 不再自动重启——防止永久故障的崩溃-重启循环持续吃 CPU | `supervisor._MAX_CONSECUTIVE_RESTARTS` |
+| **warmup** | `warmup_time` 内 consumer 不启动训练/推理，等数据积压到稳态再开始，避免冷启动抖动期的资源尖峰 | learner warmup_deadline |
+
+### 8.5 监控联动
+
+以上所有阈值与水位均经 §7 监控面板暴露并告警：
+
+- **内存**：`shm_gib`（实际占用）/ `total_ram`（物理内存）/ auto maxsize 推算值，接近 80% 预算告警
+- **CPU**：`cpu_threads`（实际线程数）/ 单核利用率，超阈值告警
+- **背压**：`queue_rejects` / `queue_depth` / `utilization`，rejects 持续非零 → 触发 §8.3 动态调节或告警人工介入
+- **稳定性**：`restart_count` / `consecutive_errors`，触发熔断或达重启上限即红色告警
+
+**总结**：内存四道闸（auto maxsize / total_shm 审计 / slot 硬限 / soft_limit 背压）+ CPU 三道闸（线程上限 / 单轮上限 / 一队列一消费者）+ 动态调节受硬保护约束 + 异常熔断防循环 = **多重保护，动态可调但绝不打满机器**。
+
+---
+
+## 9. 验证计划
+
+### 9.0 测试数据源（统一接口）
 
 benchmark 与测试的 **producer 端数据来源**支持三类，用 `--source mock|zmq|file` 切换，统一 `DataSource` 抽象（`__iter__` 产出 `dict[str, ndarray]` batch）：
 
@@ -293,13 +354,13 @@ benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报�
 
 > ZMQ 数据源依赖 `pyzmq`（已在 `monitor` optional 依赖中，复用）；file 数据源仅依赖 numpy。benchmark 启动时若缺可选依赖则跳过该模式并告警，不报错。
 
-### 8.1 单测 `python -m pytest tests/ -v`
+### 9.1 单测 `python -m pytest tests/ -v`
 
 - `test_queue.py`：fast codec 往返一致性；多进程 producer/consumer 数据正确；满队列 `push_raw` 返回 False、`soft_limit` 生效；`qsize/total_pushed/total_popped` 计数正确
 - `test_zmq_source.py`：起一个 ZMQ PUSH 进程推 N 个 batch → producer 经 `ZmqSource` 接收 → push 入 shmqueue → consumer pop 校验内容一致
 - `test_file_source.py`：预写 N 个 batch 到临时目录 → producer 经 `FileSource` 读取 → push 入 shmqueue → consumer pop 校验内容一致
 
-### 8.2 吞吐基准 `python benchmarks/bench_throughput.py`
+### 9.2 吞吐基准 `python benchmarks/bench_throughput.py`
 
 ```
 --source mock|zmq|file    # 数据源（默认三者各跑）
@@ -311,17 +372,17 @@ benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报�
 
 输出：各数据源 × 各 P/C 配置的 msg/s、MiB/s、队列开销占比。对比原 rl `DATA_SERVER_PROFILE` 的 `recv/pushed_batch` 量级，确认抽取无损。
 
-### 8.3 延迟基准 `python benchmarks/bench_latency.py`
+### 9.3 延迟基准 `python benchmarks/bench_latency.py`
 
 push→pop 单条 p50/p99（mock 源，排除 IO）。
 
-### 8.4 独立性
+### 9.4 独立性
 
 干净 venv（仅 numpy）`python -c "import shmqueue"` 成功；`pytest tests/test_queue.py tests/test_file_source.py` 通过（zmq 测试在缺 pyzmq 时 skip）。
 
 ---
 
-## 9. 状态
+## 10. 状态
 
 - [x] 仓库结构 + 需求文档（README）
 - [ ] `queue.py` 实现
