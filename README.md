@@ -178,7 +178,7 @@ shmqueue/
 │   ├── bench_throughput.py   # 1P1C / NP-MC 端到端 msg/s, MiB/s
 │   ├── bench_codec.py        # encode/decode μs/batch vs pickle
 │   ├── bench_latency.py      # push→pop 单条 p50/p99
-│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §7.0)
+│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §8.0)
 └── tests/
     ├── test_queue.py         # 基础 push/pop、满队列、多进程 attach、codec 往返
     ├── test_zmq_source.py    # ZMQ 网络发送 → shmqueue 链路
@@ -207,9 +207,64 @@ shmqueue/
 
 ---
 
-## 7. 验证计划
+## 7. 前端监控面板（监控与可视化）
 
-### 7.0 测试数据源（统一接口）
+### 7.1 前后端拆分
+
+| 层 | 职责 | 产出 |
+|----|------|------|
+| **后端**（shmqueue 核心） | queue / codec / producer / consumer / monitor + metrics 采集 | 暴露 metrics（HTTP API 或经 `LogSink` ZMQ PUSH 到外部时序库），自身不含 UI |
+| **前端**（监控面板，独立仓库/独立部署） | 消费 metrics，可视化、瓶颈定位、理论上限对比 | Web 面板（实时图表） |
+
+后端只管"采集与暴露指标"，前端只管"呈现与诊断"。两边经 metrics 接口解耦，前端可独立迭代。
+
+### 7.2 面板核心目标：快速定位问题出在哪
+
+一眼看出端到端吞吐被哪一环卡住。数据通路拆成可观测的 stage 链：
+
+```
+数据源(recv/zmq/file) → encode → push → queue_wait → pop → decode → pin_memory → h2d → algo(GPU)
+```
+
+面板提供**stage 耗时瀑布图**（每段占端到端时间的比例）。占比异常的 stage 即瓶颈：
+- `recv/zmq/file` 占比高 → 网络/磁盘 IO 瓶颈
+- `encode/decode` 占比高 → 序列化瓶颈
+- `push/pop + queue_wait` 占比高 → 队列锁争用（fcntl）瓶颈
+- `h2d` 占比高 → 未 pin / 未 non_blocking 的 H2D 瓶颈
+- `algo` 占比高 → GPU 算力瓶颈（已达理论上限，数据通路已不是瓶颈）
+
+### 7.3 理论上限 vs 实际达成（核心可视化）
+
+面板顶部一个**达成率仪表盘**，回答"我们离极限有多远"：
+
+| 指标 | 定义 | 举例 |
+|------|------|------|
+| **理论上限** | 零数据开销 baseline：数据不经队列/网络/磁盘，直接喂 GPU，GPU 纯算力每分稳定更新步数 | 10 分钟稳定更新 4000 次 ≈ 6.67 step/s |
+| **实际达成** | 端到端（数据源 → shmqueue → GPU）实测每分更新步数 | 经各种优化后达到 3800 次 ≈ 6.33 step/s |
+| **达成率** | 实际 / 理论 | 3800/4000 = 95% |
+| **损耗分解** | 理论与实际的差距被哪几环吃掉（瀑布图叠加） | 队列锁 2% + 序列化 1% + 数据源 IO 2% = 5% |
+
+理论上限用 `--source mock` 且 queue 短路（producer 直接调 consumer 回调，不经 shm）测得，作为 100% 基线。每接入一种真实数据源（zmq / file:stream / file:sample）或每项优化（lock-free、零拷贝、prefetch），面板实时显示达成率变化，量化每步优化收益。
+
+### 7.4 面板可视化元素
+
+- **实时折线**：吞吐（step/s、MiB/s）、队列深度、达成率 随时间
+- **stage 瀑布图**：各 stage 耗时占比（定位瓶颈主图）
+- **多数据源对比柱状**：mock / zmq / file:stream / file:sample 端到端吞吐并排
+- **多队列热力图**：一组队列（如 8 个）的深度/utilization，发现不均衡
+- **达成率仪表盘**：实际/理论 + 损耗分解
+
+### 7.5 技术栈（建议）
+
+- 后端 metrics：FastAPI HTTP `/metrics`（JSON），或复用 `LogSink` → ZMQ PUSH → Prometheus → Grafana 数据源
+- 前端：React + ECharts（或直接 Grafana dashboard，若走 Prometheus 路线）
+- 首期可先做 Grafana dashboard（后端 metrics 转 Prometheus 格式，零前端开发量），后续再自建 Web 面板做更精细的瀑布图/达成率仪表盘
+
+---
+
+## 8. 验证计划
+
+### 8.0 测试数据源（统一接口）
 
 benchmark 与测试的 **producer 端数据来源**支持三类，用 `--source mock|zmq|file` 切换，统一 `DataSource` 抽象（`__iter__` 产出 `dict[str, ndarray]` batch）：
 
@@ -238,13 +293,13 @@ benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报�
 
 > ZMQ 数据源依赖 `pyzmq`（已在 `monitor` optional 依赖中，复用）；file 数据源仅依赖 numpy。benchmark 启动时若缺可选依赖则跳过该模式并告警，不报错。
 
-### 7.1 单测 `python -m pytest tests/ -v`
+### 8.1 单测 `python -m pytest tests/ -v`
 
 - `test_queue.py`：fast codec 往返一致性；多进程 producer/consumer 数据正确；满队列 `push_raw` 返回 False、`soft_limit` 生效；`qsize/total_pushed/total_popped` 计数正确
 - `test_zmq_source.py`：起一个 ZMQ PUSH 进程推 N 个 batch → producer 经 `ZmqSource` 接收 → push 入 shmqueue → consumer pop 校验内容一致
 - `test_file_source.py`：预写 N 个 batch 到临时目录 → producer 经 `FileSource` 读取 → push 入 shmqueue → consumer pop 校验内容一致
 
-### 7.2 吞吐基准 `python benchmarks/bench_throughput.py`
+### 8.2 吞吐基准 `python benchmarks/bench_throughput.py`
 
 ```
 --source mock|zmq|file    # 数据源（默认三者各跑）
@@ -256,17 +311,17 @@ benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报�
 
 输出：各数据源 × 各 P/C 配置的 msg/s、MiB/s、队列开销占比。对比原 rl `DATA_SERVER_PROFILE` 的 `recv/pushed_batch` 量级，确认抽取无损。
 
-### 7.3 延迟基准 `python benchmarks/bench_latency.py`
+### 8.3 延迟基准 `python benchmarks/bench_latency.py`
 
 push→pop 单条 p50/p99（mock 源，排除 IO）。
 
-### 7.4 独立性
+### 8.4 独立性
 
 干净 venv（仅 numpy）`python -c "import shmqueue"` 成功；`pytest tests/test_queue.py tests/test_file_source.py` 通过（zmq 测试在缺 pyzmq 时 skip）。
 
 ---
 
-## 8. 状态
+## 9. 状态
 
 - [x] 仓库结构 + 需求文档（README）
 - [ ] `queue.py` 实现
