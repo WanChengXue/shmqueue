@@ -178,7 +178,7 @@ shmqueue/
 │   ├── bench_throughput.py   # 1P1C / NP-MC 端到端 msg/s, MiB/s
 │   ├── bench_codec.py        # encode/decode μs/batch vs pickle
 │   ├── bench_latency.py      # push→pop 单条 p50/p99
-│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §8.0)
+│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §7.0)
 └── tests/
     ├── test_queue.py         # 基础 push/pop、满队列、多进程 attach、codec 往返
     ├── test_zmq_source.py    # ZMQ 网络发送 → shmqueue 链路
@@ -187,20 +187,7 @@ shmqueue/
 
 ---
 
-## 6. 源映射（从 rl_framework 抽取关系）
-
-| shmqueue 文件 | rl_framework 源 | 抽取内容 | 剥离的 RL 依赖 |
-|---------------|-----------------|---------|----------------|
-| `queue.py` | `learner/shared_memory_queue.py` | `SharedMemoryQueue` 整类 + `compute_auto_maxsize` | 无（本就纯通用） |
-| `codec.py` | `learner/data_server.py::_encode_batch_fast` + `learner/learner_server.py::_decode_batch_fast` | flat-binary 编解码 | 无 |
-| `producer.py` | `learner/data_server.py` 的 `_connect_to_queue_server` + `_batch_builder` 的 push 段 | Producer API | replay buffer / env / data_model |
-| `consumer.py` | `learner/learner_server.py` 的 `_connect_queue_server` + `_prefetch_worker` + `_recursive_pin` | Consumer + prefetch 流水线 | algo / model / DDP / env |
-| `monitor.py` | `learner/queue_server.py` | Monitor | BaseServer 的 config 耦合 |
-| `base.py` | `learner/base_server.py` | ZMQ PUSH log 转发 → `LogSink` | config_utils |
-
----
-
-## 7. 优化路线（实现后逐步推进，量化对比）
+## 6. 优化路线（实现后逐步推进，量化对比）
 
 搬运后**先保持与原 rl 行为一致**（保证正确性 + 可回灌验证），再按下列方向优化，每个优化都由 benchmark 量化：
 
@@ -220,33 +207,44 @@ shmqueue/
 
 ---
 
-## 8. 验证计划
+## 7. 验证计划
 
-### 8.0 测试数据源（三选一，统一接口）
+### 7.0 测试数据源（统一接口）
 
-benchmark 与测试的 **producer 端数据来源**支持三种模式，用 `--source mock|zmq|file` 切换，统一 `DataSource` 抽象（`__iter__` 产出 `dict[str, ndarray]` batch）：
+benchmark 与测试的 **producer 端数据来源**支持三类，用 `--source mock|zmq|file` 切换，统一 `DataSource` 抽象（`__iter__` 产出 `dict[str, ndarray]` batch）：
 
 | 模式 | 说明 | 模拟的真实场景 |
 |------|------|----------------|
 | `mock` | 内存中即时生成随机 numpy batch | 纯压测队列/codec 上限，排除 IO 干扰 |
-| `zmq` | 启动 ZMQ PULL socket，从外部 ZMQ PUSH 接收 batch（字节/lz4 压缩） | 模拟真实 worker → data_server 的网络输入（多 worker 经网络推数据） |
-| `file` | 从本地文件读取预先生成的 batch（`.npy` / `.npz` / pickle） | 模拟从磁盘加载离线数据集 / 回放录制数据 |
+| `zmq` | 启动 ZMQ PULL socket，从外部 ZMQ PUSH 接收 batch（字节/lz4 压缩） | **网络输入**：模拟真实 worker → data_server 的网络推流（多 worker 经网络推数据） |
+| `file` | 从本地磁盘读取预先生成的 batch（`.npy` / `.npz` / pickle），**两种子模式**见下 | **本地 IO 输入**：与 zmq 相反，数据来自磁盘而非网络 |
 
 - `mock`：基准对照组，衡量队列本身吞吐天花板
-- `zmq`：测**网络接收 + 入队**的端到端，反映真实多 worker 推流下队列是否成为瓶颈
+- `zmq`：测**网络接收 + 入队**，反映多 worker 推流下队列是否成为瓶颈
 - `file`：测**磁盘 IO + 入队**，反映离线数据回放场景
 
-benchmark 默认对三种数据源各跑一遍，报告各自吞吐，便于定位瓶颈在队列、在网络、还是在磁盘。
+#### `file` 的两种模式（`--file-mode stream|sample`）
+
+| 子模式 | 行为 | 适用场景 |
+|--------|------|----------|
+| `stream` | **顺序流式**：按文件名顺序遍历目录，逐文件读 batch 推队列，遍历完可 `--loop` 循环 | 确定性回放（复现实验、按序消费录制数据集） |
+| `sample` | **随机采样**：从文件池随机抽 batch 推队列，可重复采样（有放回） | 模拟 replay buffer 的随机 minibatch 抽取，测随机读下磁盘/队列行为 |
+
+- 两子模式共享同一 `FileSource`，仅遍历策略不同：`stream` 顺序索引、`sample` 随机索引
+- `stream` 顺序读对 OS 预读友好，吞吐接近顺序磁盘上限；`sample` 随机读触发寻道，反映真实训练采样下的 IO 表现
+- benchmark 默认对 `file` 两子模式各跑一遍，对比顺序 vs 随机 IO 对吞吐的影响
+
+benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报告各自吞吐，便于定位瓶颈在队列、在网络、还是在磁盘（顺序/随机）。
 
 > ZMQ 数据源依赖 `pyzmq`（已在 `monitor` optional 依赖中，复用）；file 数据源仅依赖 numpy。benchmark 启动时若缺可选依赖则跳过该模式并告警，不报错。
 
-### 8.1 单测 `python -m pytest tests/ -v`
+### 7.1 单测 `python -m pytest tests/ -v`
 
 - `test_queue.py`：fast codec 往返一致性；多进程 producer/consumer 数据正确；满队列 `push_raw` 返回 False、`soft_limit` 生效；`qsize/total_pushed/total_popped` 计数正确
 - `test_zmq_source.py`：起一个 ZMQ PUSH 进程推 N 个 batch → producer 经 `ZmqSource` 接收 → push 入 shmqueue → consumer pop 校验内容一致
 - `test_file_source.py`：预写 N 个 batch 到临时目录 → producer 经 `FileSource` 读取 → push 入 shmqueue → consumer pop 校验内容一致
 
-### 8.2 吞吐基准 `python benchmarks/bench_throughput.py`
+### 7.2 吞吐基准 `python benchmarks/bench_throughput.py`
 
 ```
 --source mock|zmq|file    # 数据源（默认三者各跑）
@@ -258,17 +256,17 @@ benchmark 默认对三种数据源各跑一遍，报告各自吞吐，便于定�
 
 输出：各数据源 × 各 P/C 配置的 msg/s、MiB/s、队列开销占比。对比原 rl `DATA_SERVER_PROFILE` 的 `recv/pushed_batch` 量级，确认抽取无损。
 
-### 8.3 延迟基准 `python benchmarks/bench_latency.py`
+### 7.3 延迟基准 `python benchmarks/bench_latency.py`
 
 push→pop 单条 p50/p99（mock 源，排除 IO）。
 
-### 8.4 独立性
+### 7.4 独立性
 
 干净 venv（仅 numpy）`python -c "import shmqueue"` 成功；`pytest tests/test_queue.py tests/test_file_source.py` 通过（zmq 测试在缺 pyzmq 时 skip）。
 
 ---
 
-## 9. 状态
+## 8. 状态
 
 - [x] 仓库结构 + 需求文档（README）
 - [ ] `queue.py` 实现
