@@ -178,7 +178,7 @@ shmqueue/
 │   ├── bench_throughput.py   # 1P1C / NP-MC 端到端 msg/s, MiB/s
 │   ├── bench_codec.py        # encode/decode μs/batch vs pickle
 │   ├── bench_latency.py      # push→pop 单条 p50/p99
-│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §9.0)
+│   └── data_source.py        # 测试数据源: mock / zmq / file (见 §10.0)
 └── tests/
     ├── test_queue.py         # 基础 push/pop、满队列、多进程 attach、codec 往返
     ├── test_zmq_source.py    # ZMQ 网络发送 → shmqueue 链路
@@ -323,9 +323,63 @@ CPU 保护思路：**所有并发源都有显式上限**（线程数、单轮处
 
 ---
 
-## 9. 验证计划
+## 9. 实测诊断：单 GPU 训练数据通路瓶颈
 
-### 9.0 测试数据源（统一接口）
+以下图表取自一次真实的单 GPU rl 训练（`breakout_ppo_1gpu`：1 learner × 1 GPU、8 data_server × 8 shmqueue、100 worker），TensorBoard 事件文件经 `docs/plot_figures.py` 解析绘制。它们用实测数据印证了 §1.1 的数据通路结构与 §7 / §8 的设计动机：**数据供给速度远慢于 GPU 消耗，队列始终为空，GPU 大部分时间在等数据**。
+
+### 9.1 队列始终为空 —— 数据供给 ≪ GPU 消耗
+
+![queue depth](docs/figures/fig1_queue_depth.png)
+
+8 个共享内存队列的深度与利用率**全程恒为 0**（`depth ≡ 0`、`utilization_pct ≡ 0%`）。结合 §1.1 的 1:1（ds→queue）与 N:1（queue→learner）结构：data_server 推入的数据几乎立刻被 learner 的 prefetch worker 取走，队列从未积压。这意味着 **learner 绝大多数时刻 pop 到的是空队列**——consumer 一直在饿，而非 producer 在堵。`queue_rejects ≡ 0`（图 4c）也印证：满队列丢批从未触发，因为队列从来不满。
+
+### 9.2 GPU 时间占比 —— algo 仅 ~9%，queue_get ~80%
+
+![gpu time breakdown](docs/figures/fig2_gpu_time_breakdown.png)
+
+learner 每分钟时间占比拆解：
+
+- **algo（GPU 算力）均值仅 0.09**（~9%），后期跌破 2%——GPU 绝大部分时间闲置
+- **queue_get（等队列取数据）均值 0.79**（~80%）——时间几乎全耗在等数据上
+- h2d / logger / model_send / metrics_send 合计 < 2%，均非瓶颈
+
+这正是 §7.2 stage 瀑布图要定位的形态：`queue_get` 占比异常高 → 数据通路（而非 GPU 算力）是瓶颈。所谓"GPU 利用率只有 0.06"即 `algo_step_ratio` 的实测值。
+
+### 9.3 吞吐达成率 —— 平均 ~28% 理论上限
+
+![update rate vs ceiling](docs/figures/fig3_update_rate_vs_ceiling.png)
+
+- **理论上限** ≈ 400 update/min（零数据开销下 10 分钟稳定 4000 次，§7.3）
+- **实测均值** ~113 update/min（峰值 337、后期回落至 20）
+- **达成率** ≈ 113/400 ≈ **28%**
+
+损耗几乎全部来自 §9.2 的 queue_get 等待（数据饥饿），而非队列锁或序列化——反向证明 shmqueue 本身的 push/pop/codec 开销可忽略（占比 < 2%），优化方向应是**上游数据供给速率**，而非队列本身。
+
+### 9.4 数据慢的根因 —— worker 采样耗时
+
+![sampler throughput](docs/figures/fig4_sampler_throughput.png)
+
+- **单 episode 采样均值 1.26s**（max 37.6s）：100 个 worker 各自产 trajectory，单条就要秒级，聚合后供给速率跟不上 learner 单 step ~10ms 的消耗
+- data_server 每周期 recv 均值 21 条、pushed_batch 均值 14：recv 速率本身就不高
+- `queue_rejects ≡ 0` + 活跃 worker 数波动（29~244）：worker 采样耗时不稳定，进一步加剧供给波动
+
+### 9.5 结论与对 shmqueue 的启示
+
+| 现象 | 实测 | 对应 shmqueue 设计点 |
+|------|------|---------------------|
+| 队列始终空 | depth/util ≡ 0 | §1.1 数据通路结构、§3.1 背压行为（本例背压从未触发，因 consumer 远快于 producer） |
+| GPU 闲置 | algo ~9% | §7.2 stage 瀑布图定位、§7.3 达成率仪表盘 |
+| 达成率低 | ~28% | §7.3 理论上限 vs 实际 |
+| 队列开销可忽略 | push/pop/codec < 2% | §6 优化路线（锁/codec 非当前瓶颈，先解供给） |
+| 供给是瓶颈 | sample 1.26s/ep | shmqueue 范围外（worker 采样），但 §8.3 动态调节的 soft_limit 在此场景应调小（队列本就空，缓冲无意义） |
+
+> 复现：`python docs/plot_figures.py <events.out.tfevents.*> docs/figures`（需 `tensorboard`、`matplotlib`、`pandas`）
+
+---
+
+## 10. 验证计划
+
+### 10.0 测试数据源（统一接口）
 
 benchmark 与测试的 **producer 端数据来源**支持三类，用 `--source mock|zmq|file` 切换，统一 `DataSource` 抽象（`__iter__` 产出 `dict[str, ndarray]` batch）：
 
@@ -354,13 +408,13 @@ benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报�
 
 > ZMQ 数据源依赖 `pyzmq`（已在 `monitor` optional 依赖中，复用）；file 数据源仅依赖 numpy。benchmark 启动时若缺可选依赖则跳过该模式并告警，不报错。
 
-### 9.1 单测 `python -m pytest tests/ -v`
+### 10.1 单测 `python -m pytest tests/ -v`
 
 - `test_queue.py`：fast codec 往返一致性；多进程 producer/consumer 数据正确；满队列 `push_raw` 返回 False、`soft_limit` 生效；`qsize/total_pushed/total_popped` 计数正确
 - `test_zmq_source.py`：起一个 ZMQ PUSH 进程推 N 个 batch → producer 经 `ZmqSource` 接收 → push 入 shmqueue → consumer pop 校验内容一致
 - `test_file_source.py`：预写 N 个 batch 到临时目录 → producer 经 `FileSource` 读取 → push 入 shmqueue → consumer pop 校验内容一致
 
-### 9.2 吞吐基准 `python benchmarks/bench_throughput.py`
+### 10.2 吞吐基准 `python benchmarks/bench_throughput.py`
 
 ```
 --source mock|zmq|file    # 数据源（默认三者各跑）
@@ -372,19 +426,20 @@ benchmark 默认对三类数据源（file 含两子模式）各跑一遍，报�
 
 输出：各数据源 × 各 P/C 配置的 msg/s、MiB/s、队列开销占比。对比原 rl `DATA_SERVER_PROFILE` 的 `recv/pushed_batch` 量级，确认抽取无损。
 
-### 9.3 延迟基准 `python benchmarks/bench_latency.py`
+### 10.3 延迟基准 `python benchmarks/bench_latency.py`
 
 push→pop 单条 p50/p99（mock 源，排除 IO）。
 
-### 9.4 独立性
+### 10.4 独立性
 
 干净 venv（仅 numpy）`python -c "import shmqueue"` 成功；`pytest tests/test_queue.py tests/test_file_source.py` 通过（zmq 测试在缺 pyzmq 时 skip）。
 
 ---
 
-## 10. 状态
+## 11. 状态
 
 - [x] 仓库结构 + 需求文档（README）
+- [x] 实测诊断图（§9，取自真实单 GPU 训练 TensorBoard，4 张 PNG + 绘图脚本）
 - [ ] `queue.py` 实现
 - [ ] `codec.py` 实现
 - [ ] `producer.py` / `consumer.py` 实现
